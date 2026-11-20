@@ -1,0 +1,2565 @@
+; Expiry-Aware Pharmacy Stock and Billing System  -  GUI VERSION (final)
+; x86 MASM (32-bit), plain Win32 API (kernel32 / user32 / gdi32)
+;
+; Irvine32 only works in a console window, so this version talks to
+; Windows directly. The pharmacy logic (arrays, batches, expiry,
+; earliest-expiry-first selling, bill, reports, file) is the same as
+; the console program. Only the screen and keyboard part is new.
+;
+; Screen layout
+;   left   : 11 menu buttons (owner-drawn: Expiry Loss = red,
+;            Reorder = yellow, like the colours in the proposal)
+;   top    : up to 3 labelled input boxes + OK button (+ Finish Bill)
+;   centre : black output list (owner-drawn, so lines can be coloured)
+;
+; Build (Visual Studio 2022, x86):
+;   - add this file, item type = Microsoft Macro Assembler
+;   - Linker > System > SubSystem        : Windows
+;   - Linker > Advanced > Entry Point    : start
+;   - Linker > Advanced > Image Has Safe Exception Handlers : No
+;   - Irvine32 is NOT needed for this file
+;
+; Password : pharma123
+; ====================================================================
+
+.386
+.model flat, stdcall
+option casemap:none
+
+includelib kernel32.lib
+includelib user32.lib
+includelib gdi32.lib
+
+; --------------------------------------------------------------------
+; Windows API prototypes (only the ones we use)
+; --------------------------------------------------------------------
+GetModuleHandleA   PROTO :DWORD
+ExitProcess        PROTO :DWORD
+CreateFileA        PROTO :DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD
+ReadFile           PROTO :DWORD,:DWORD,:DWORD,:DWORD,:DWORD
+WriteFile          PROTO :DWORD,:DWORD,:DWORD,:DWORD,:DWORD
+CloseHandle        PROTO :DWORD
+
+RegisterClassExA   PROTO :DWORD
+CreateWindowExA    PROTO :DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD,:DWORD
+ShowWindow         PROTO :DWORD,:DWORD
+GetMessageA        PROTO :DWORD,:DWORD,:DWORD,:DWORD
+TranslateMessage   PROTO :DWORD
+DispatchMessageA   PROTO :DWORD
+IsDialogMessageA   PROTO :DWORD,:DWORD
+PostQuitMessage    PROTO :DWORD
+DefWindowProcA     PROTO :DWORD,:DWORD,:DWORD,:DWORD
+SendMessageA       PROTO :DWORD,:DWORD,:DWORD,:DWORD
+GetWindowTextA     PROTO :DWORD,:DWORD,:DWORD
+SetWindowTextA     PROTO :DWORD,:DWORD
+MessageBoxA        PROTO :DWORD,:DWORD,:DWORD,:DWORD
+LoadCursorA        PROTO :DWORD,:DWORD
+EnableWindow       PROTO :DWORD,:DWORD
+SetFocus           PROTO :DWORD
+DestroyWindow      PROTO :DWORD
+FillRect           PROTO :DWORD,:DWORD,:DWORD
+DrawEdge           PROTO :DWORD,:DWORD,:DWORD,:DWORD
+DrawTextA          PROTO :DWORD,:DWORD,:DWORD,:DWORD,:DWORD
+DrawFocusRect      PROTO :DWORD,:DWORD
+GetSysColorBrush   PROTO :DWORD
+wsprintfA          PROTO C :DWORD,:DWORD,:VARARG
+
+SetTextColor       PROTO :DWORD,:DWORD
+SetBkMode          PROTO :DWORD,:DWORD
+CreateSolidBrush   PROTO :DWORD
+GetStockObject     PROTO :DWORD
+TextOutA           PROTO :DWORD,:DWORD,:DWORD,:DWORD,:DWORD
+
+; --------------------------------------------------------------------
+; Prototypes of our own procedures that are called with INVOKE
+; --------------------------------------------------------------------
+WndProc            PROTO :DWORD,:DWORD,:DWORD,:DWORD
+StrCopy            PROTO :DWORD,:DWORD
+StrCompare         PROTO :DWORD,:DWORD,:DWORD
+DateToDays         PROTO :DWORD
+IsValidDate        PROTO :DWORD
+GetBatchStatus     PROTO :DWORD
+FindMedicineById   PROTO :DWORD
+FindMedicineByName PROTO :DWORD
+GetUsableStock     PROTO :DWORD
+FindEarliestBatch  PROTO :DWORD
+TakeStockFromBatches PROTO :DWORD,:DWORD
+RemoveBatchAt      PROTO :DWORD
+RemoveMedicineAt   PROTO :DWORD
+DeleteMedicine     PROTO :DWORD
+CompareMedNames    PROTO :DWORD,:DWORD
+SwapMedicines      PROTO :DWORD,:DWORD
+SortMedicines      PROTO :DWORD
+ShowMedicineDetails PROTO :DWORD
+PutLine            PROTO :DWORD,:DWORD
+ShowError          PROTO :DWORD
+ShowInfo           PROTO :DWORD
+ApplyFont          PROTO :DWORD
+GetNum             PROTO :DWORD
+GetRangeField      PROTO :DWORD,:DWORD,:DWORD,:DWORD
+ShowForm           PROTO :DWORD,:DWORD,:DWORD,:DWORD,:DWORD
+SetField           PROTO :DWORD,:DWORD,:DWORD,:DWORD
+HandleMenu         PROTO :DWORD
+WriteChunk         PROTO :DWORD,:DWORD
+ReadChunk          PROTO :DWORD,:DWORD
+
+; --------------------------------------------------------------------
+; Structures
+; --------------------------------------------------------------------
+WNDCLASSEXA STRUCT
+    cbSize        DWORD ?
+    style         DWORD ?
+    lpfnWndProc   DWORD ?
+    cbClsExtra    DWORD ?
+    cbWndExtra    DWORD ?
+    hInstance     DWORD ?
+    hIcon         DWORD ?
+    hCursor       DWORD ?
+    hbrBackground DWORD ?
+    lpszMenuName  DWORD ?
+    lpszClassName DWORD ?
+    hIconSm       DWORD ?
+WNDCLASSEXA ENDS
+
+MSGSTRUCT STRUCT
+    hwnd     DWORD ?
+    message  DWORD ?
+    wParam   DWORD ?
+    lParam   DWORD ?
+    time     DWORD ?
+    ptX      DWORD ?
+    ptY      DWORD ?
+MSGSTRUCT ENDS
+
+; --------------------------------------------------------------------
+; Project constants
+; --------------------------------------------------------------------
+MAX_MEDICINES    = 30
+MAX_BATCHES      = 60
+NAME_SIZE        = 20          ; 19 letters + the 0 at the end
+MAX_BILL_ITEMS   = 10
+MAX_ATTEMPTS     = 3
+LOW_STOCK_LIMIT  = 10
+TARGET_STOCK     = 30
+SOON_DAYS        = 30
+DISCOUNT_LIMIT   = 1000
+MAX_PRICE        = 50000       ; keeps price * quantity inside 32 bits
+MAX_QTY          = 5000
+MAX_ID           = 999999999
+MAX_BILL_TOTAL   = 100000000   ; one bill may not pass Rs. 100,000,000
+
+STATUS_OK        = 0
+STATUS_SOON      = 1
+STATUS_EXPIRED   = 2
+
+COUNTERS_SIZE    = 28          ; 7 DWORDs saved as one block
+
+; what the OK button should do right now
+MODE_NONE        = 0
+MODE_DATE        = 1
+MODE_LOGIN       = 2
+MODE_ADD_MED     = 3
+MODE_ADD_BATCH   = 4
+MODE_SEARCH_ID   = 5
+MODE_SEARCH_NAME = 6
+MODE_UPDATE      = 7
+MODE_DELETE      = 8
+MODE_SELL        = 9
+
+; control / menu ids
+ID_OK            = 1
+ID_FINISH        = 202
+ID_SELL          = 107
+ID_LOSS          = 108
+ID_REORDER       = 109
+ID_LIST          = 320
+
+; output colours (COLORREF = 00BBGGRR)
+CLR_WHITE        = 0FFFFFFh
+CLR_RED          = 05050FFh
+CLR_YELLOW       = 000FFFFh
+CLR_GREEN        = 050E050h
+CLR_CYAN         = 0FFFF00h
+CLR_GRAY         = 0C0C0C0h
+
+; menu button colours
+BTN_RED          = 0B4B4FFh    ; light red
+BTN_YELLOW       = 0A0F0FFh    ; light yellow
+BTN_TEXT_OFF     = 0808080h    ; text of a disabled button
+
+; Windows constants
+WM_CREATE        = 0001h
+WM_DESTROY       = 0002h
+WM_CLOSE         = 0010h
+WM_SETFONT       = 0030h
+WM_MEASUREITEM   = 002Ch
+WM_DRAWITEM      = 002Bh
+WM_COMMAND       = 0111h
+WM_CTLCOLORLISTBOX = 0134h
+
+WS_CHILD         = 40000000h
+WS_VISIBLE       = 10000000h
+WS_TABSTOP       = 00010000h
+WS_VSCROLL       = 00200000h
+WS_MAINWINDOW    = 00CA0000h   ; caption + system menu + minimize box
+WS_EX_CLIENTEDGE = 00000200h
+
+BS_DEFPUSHBUTTON = 1
+BS_OWNERDRAW     = 0Bh
+ES_AUTOHSCROLL   = 80h
+EM_SETPASSWORDCHAR = 0CCh
+EM_LIMITTEXT     = 0C5h
+
+LBS_HASSTRINGS      = 0040h
+LBS_OWNERDRAWFIXED  = 0010h
+LBS_NOINTEGRALHEIGHT = 0100h
+LB_ADDSTRING     = 0180h
+LB_RESETCONTENT  = 0184h
+LB_GETTEXT       = 0189h
+LB_SETITEMDATA   = 019Ah
+LB_GETITEMDATA   = 0199h
+
+; owner-draw button helpers
+ODS_SELECTED     = 0001h
+ODS_DISABLED     = 0004h
+ODS_FOCUS        = 0010h
+EDGE_RAISED      = 5
+EDGE_SUNKEN      = 0Ah
+BF_RECT          = 0Fh
+DT_LEFT_VCENTER  = 24h         ; DT_LEFT or DT_VCENTER or DT_SINGLELINE
+COLOR_BTNFACE_ID = 15
+
+SW_HIDE          = 0
+SW_SHOW          = 5
+
+MB_OK            = 0
+MB_YESNO         = 4
+MB_YESNOCANCEL   = 3
+MB_ICONERROR     = 10h
+MB_ICONQUESTION  = 20h
+MB_ICONINFORMATION = 40h
+IDYES            = 6
+IDNO             = 7
+
+IDC_ARROW        = 32512
+DEFAULT_GUI_FONT = 17
+ANSI_FIXED_FONT  = 11
+
+GENERIC_READ     = 80000000h
+GENERIC_WRITE    = 40000000h
+CREATE_ALWAYS    = 2
+OPEN_EXISTING    = 3
+FILE_ATTRIBUTE_NORMAL = 80h
+INVALID_HANDLE_VALUE  EQU -1
+
+; --------------------------------------------------------------------
+; Macros for the file code (write / read one block and check it)
+; --------------------------------------------------------------------
+WritePart MACRO dataLabel, byteCount
+    invoke WriteChunk, OFFSET dataLabel, byteCount
+ENDM
+
+ReadPart MACRO dataLabel, byteCount
+    invoke ReadChunk, OFFSET dataLabel, byteCount
+    cmp  eax, byteCount
+    jne  ldReadFail
+ENDM
+
+.data
+
+; ---- window and control handles
+hInst        DWORD 0
+hMain        DWORD 0
+hList        DWORD 0
+hLblInfo     DWORD 0
+hLblDate     DWORD 0
+hLbl1        DWORD 0
+hLbl2        DWORD 0
+hLbl3        DWORD 0
+hEdit1       DWORD 0
+hEdit2       DWORD 0
+hEdit3       DWORD 0
+hBtnOK       DWORD 0
+hBtnFinish   DWORD 0
+hBtns        DWORD 11 DUP(0)
+hGuiFont     DWORD 0
+hFixedFont   DWORD 0
+hBlackBrush  DWORD 0
+hBrushFace   DWORD 0
+hBrushRed    DWORD 0
+hBrushYellow DWORD 0
+
+wc           WNDCLASSEXA <>
+msg          MSGSTRUCT <>
+
+; ---- program state
+curMode      DWORD 0
+loginTries   DWORD 0
+loggedIn     DWORD 0
+loadStatus   DWORD 0           ; 0 = no file, 1 = loaded, 2 = damaged file
+writeFailed  DWORD 0
+
+; ---- saved counters: these 7 DWORDs must stay together
+medCount     DWORD 0
+batCount     DWORD 0
+billCount    DWORD 0
+itemsSold    DWORD 0
+totalSales   DWORD 0
+maxBill      DWORD 0
+lastSaleDate DWORD 0
+
+todayDate    DWORD 0
+
+; ---- medicine arrays (30)
+medID        DWORD MAX_MEDICINES DUP(0)
+medName      BYTE  (MAX_MEDICINES * NAME_SIZE) DUP(0)
+medPrice     DWORD MAX_MEDICINES DUP(0)
+medSold      DWORD MAX_MEDICINES DUP(0)
+
+; ---- batch arrays (60)
+batMed       DWORD MAX_BATCHES DUP(0)
+batQty       DWORD MAX_BATCHES DUP(0)
+batExpiry    DWORD MAX_BATCHES DUP(0)
+
+; ---- current bill
+billItemCount  DWORD 0
+billItemMed    DWORD MAX_BILL_ITEMS DUP(0)
+billItemQty    DWORD MAX_BILL_ITEMS DUP(0)
+billItemAmount DWORD MAX_BILL_ITEMS DUP(0)
+billSubtotal   DWORD 0
+billDiscount   DWORD 0
+billTotal      DWORD 0
+
+; ---- report helpers
+expiredLoss  DWORD 0
+soonLoss     DWORD 0
+lossRows     DWORD 0
+lowCount     DWORD 0
+lowList      DWORD MAX_MEDICINES DUP(0)
+tmpValue     DWORD 0
+tmpColor     DWORD 0
+tmpTag       DWORD 0
+
+; ---- text buffers
+nameBuf      BYTE 64 DUP(0)
+numBuf       BYTE 32 DUP(0)
+passBuf      BYTE 32 DUP(0)
+lineBuf      BYTE 256 DUP(0)
+drawBuf      BYTE 256 DUP(0)
+tempName     BYTE NAME_SIZE DUP(0)
+
+; ---- file
+dataFileName BYTE "pharmacy_data.bin", 0
+fileHandle   DWORD 0
+bytesDone    DWORD 0
+
+; ---- login
+correctPassword BYTE "pharma123", 0
+
+; Days in each month (February = 29; Feb 29 is checked against leap years)
+monthDays    BYTE 31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31
+
+; ---- window class names and titles
+clsAppName   BYTE "PharmacyWindow", 0
+clsButton    BYTE "BUTTON", 0
+clsEdit      BYTE "EDIT", 0
+clsStatic    BYTE "STATIC", 0
+clsListBox   BYTE "LISTBOX", 0
+windowTitle  BYTE "Expiry-Aware Pharmacy Stock and Billing System", 0
+titleError   BYTE "Error", 0
+titleInfo    BYTE "Pharmacy", 0
+titleAsk     BYTE "Choose", 0
+emptyStr     BYTE 0
+txtOK        BYTE "OK", 0
+txtFinish    BYTE "Finish Bill", 0
+
+; ---- menu button captions
+btn1         BYTE "1.  Add Medicine", 0
+btn2         BYTE "2.  Add Batch / Restock", 0
+btn3         BYTE "3.  View Stock", 0
+btn4         BYTE "4.  Search Medicine", 0
+btn5         BYTE "5.  Update / Delete Medicine", 0
+btn6         BYTE "6.  Sort Medicines", 0
+btn7         BYTE "7.  Sell Medicine and Print Bill", 0
+btn8         BYTE "8.  Expiry Loss Report", 0
+btn9         BYTE "9.  Reorder Suggestion", 0
+btn10        BYTE "10. Daily Sales Report", 0
+btn11        BYTE "0.  Save and Exit", 0
+btnTexts     DWORD OFFSET btn1, OFFSET btn2, OFFSET btn3, OFFSET btn4
+             DWORD OFFSET btn5, OFFSET btn6, OFFSET btn7, OFFSET btn8
+             DWORD OFFSET btn9, OFFSET btn10, OFFSET btn11
+
+; ---- form captions
+lblDateField   BYTE "Today (YYYYMMDD):", 0
+lblPassField   BYTE "Password:", 0
+lblMedId       BYTE "Medicine ID:", 0
+lblMedName     BYTE "Medicine name:", 0
+lblPrice       BYTE "Price (Rs.):", 0
+lblNewPrice    BYTE "New price (Rs.):", 0
+lblQty         BYTE "Quantity:", 0
+lblExpiry      BYTE "Expiry (YYYYMMDD):", 0
+
+infoDate       BYTE "Step 1 of 2: enter today's date and press OK.", 0
+infoLogin      BYTE "Step 2 of 2: staff login. You have 3 attempts.", 0
+infoReady      BYTE "Choose an option from the menu on the left.", 0
+infoAddMed     BYTE "ADD MEDICINE: fill in the 3 boxes, then press OK.", 0
+infoAddBatch   BYTE "ADD BATCH / RESTOCK: fill in the 3 boxes, then press OK.", 0
+infoSearchId   BYTE "SEARCH BY ID: type the ID and press OK.", 0
+infoSearchName BYTE "SEARCH BY NAME: type the name (any letter case) and press OK.", 0
+infoUpdate     BYTE "UPDATE PRICE: type the ID and the new price, then press OK.", 0
+infoDelete     BYTE "DELETE MEDICINE: type the ID and press OK.", 0
+infoSell       BYTE "SELL: add one item at a time (OK), then press Finish Bill.", 0
+infoView       BYTE "VIEW STOCK (red = expired, yellow = expires within 30 days)", 0
+infoSort       BYTE "SORT MEDICINES", 0
+infoLoss       BYTE "EXPIRY LOSS REPORT", 0
+infoReorder    BYTE "REORDER SUGGESTION (fast sellers first)", 0
+infoSales      BYTE "DAILY SALES REPORT", 0
+
+; ---- questions asked with message boxes
+askSearch      BYTE "Search by ID?", 10, "Yes = by ID     No = by name", 0
+askUpdateDel   BYTE "What do you want to do?", 10, "Yes = update price     No = delete medicine", 0
+askSort        BYTE "How should the medicines be sorted?", 10, "Yes = by name (A to Z)     No = by price (low to high)", 0
+askConfirmDel  BYTE "Delete this medicine and ALL its batches?", 0
+
+; ---- error and information messages
+msgBadDate     BYTE "Invalid date. Use a real date as YYYYMMDD (year 2000 to 2100).", 0
+msgBadId       BYTE "Invalid ID. Enter a whole number greater than 0.", 0
+msgBadName     BYTE "Invalid name. It must be 1 to 19 characters long.", 0
+msgBadPrice    BYTE "Invalid price. Enter a whole number from 1 to 50000.", 0
+msgBadQty      BYTE "Invalid quantity. Enter a whole number from 1 to 5000.", 0
+msgDuplicate   BYTE "This ID already exists. Duplicate IDs are not allowed.", 0
+msgDupName     BYTE "A medicine with this name already exists.", 0
+msgNotFound    BYTE "Medicine not found.", 0
+msgNoMeds      BYTE "There are no medicines yet. Add a medicine first.", 0
+msgMedFull     BYTE "Medicine list is full (maximum 30).", 0
+msgBatchFull   BYTE "Batch list is full (maximum 60).", 0
+msgOutOfStock  BYTE "No usable (non-expired) stock for this medicine.", 0
+msgBillFull    BYTE "The bill has 10 items. It will be finished now.", 0
+msgBillTooBig  BYTE "This bill would become too large (limit Rs. 100000000). Finish the bill first.", 0
+msgNoItemsSold BYTE "No items have been added to the bill yet.", 0
+msgBillOpen    BYTE "A bill is still open. Press 'Finish Bill' first.", 0
+msgTooMany     BYTE "Too many wrong attempts. The program will close.", 0
+msgNeedTwo     BYTE "You need at least 2 medicines to sort.", 0
+msgMedAdded    BYTE "Medicine added successfully!", 0
+msgBatchAdded  BYTE "Batch added successfully!", 0
+msgBatchOld    BYTE "Batch added, but its expiry date is already past. It cannot be sold.", 0
+msgPriceDone   BYTE "Price updated!", 0
+msgDeleted     BYTE "Medicine and its batches were deleted.", 0
+msgSaved       BYTE "Data saved to pharmacy_data.bin. Goodbye!", 0
+msgSaveError   BYTE "ERROR: could not write the data file!", 0
+
+; ---- lines printed in the output list
+msgWelcome     BYTE "=== EXPIRY-AWARE PHARMACY SYSTEM ===", 0
+msgNoFile      BYTE "No saved file found. Starting with empty data.", 0
+msgBadFile     BYTE "The saved file was damaged. Starting with empty data.", 0
+msgLoginOk     BYTE "Login successful!", 0
+msgNoMedsLine  BYTE "No medicines in the system yet.", 0
+msgNoBatches   BYTE "      (no batches yet)", 0
+msgStockHead   BYTE "------------- CURRENT STOCK -------------", 0
+msgSortedHead  BYTE "Medicines sorted! New order:", 0
+msgLossHead    BYTE "---------- EXPIRY LOSS REPORT ----------", 0
+msgNoRisk      BYTE "No expired or soon-to-expire stock. Great!", 0
+msgReorderHead BYTE "------ LOW STOCK (below 10 usable units) ------", 0
+msgAllGood     BYTE "All medicines have enough usable stock.", 0
+msgSalesHead   BYTE "------------ DAILY SALES REPORT ------------", 0
+msgSellHint1   BYTE "Selling takes stock from the earliest-expiry batch first.", 0
+msgSellHint2   BYTE "Expired batches are never sold.", 0
+msgReceiptTop  BYTE "=============== PHARMACY BILL ===============", 0
+msgReceiptEnd  BYTE "==============================================", 0
+
+; ---- tags
+tagOk          BYTE "[OK]", 0
+tagSoon        BYTE "[EXPIRES SOON]", 0
+tagExpired     BYTE "[EXPIRED]", 0
+tagSoonShort   BYTE "[SOON]", 0
+
+; ---- wsprintf formats (%u = unsigned, so big money values never show as negative)
+fmtToday       BYTE "Today: %d", 0
+fmtLoaded      BYTE "Saved data loaded.  Medicines: %d   Batches: %d", 0
+fmtWrongPass   BYTE "Wrong password! Attempts left: %d", 0
+fmtNotEnough   BYTE "Not enough stock! Only %d usable unit(s) available. Sale refused.", 0
+fmtMed         BYTE "ID: %-5d Name: %-19s Price: Rs. %-6d Usable stock: %d", 0
+fmtBatch       BYTE "      Batch -> Qty: %-5d Expiry: %d  %s", 0
+fmtTook        BYTE "   took %d unit(s) from the batch expiring %d", 0
+fmtItem        BYTE "Item added: %s x %d = Rs. %u", 0
+fmtBillHead    BYTE "Bill No: %d       Date: %d", 0
+fmtBillLine    BYTE "%-19s x %-4d = Rs. %u", 0
+fmtSubtotal    BYTE "Subtotal      : Rs. %u", 0
+fmtDiscount    BYTE "Discount (5%%) : Rs. %u", 0
+fmtTotal       BYTE "TOTAL         : Rs. %u", 0
+fmtLoss        BYTE "%-14s %-19s Qty: %-5d Expiry: %d  Value: Rs. %u", 0
+fmtExpiredTot  BYTE "Total EXPIRED stock value   : Rs. %u", 0
+fmtSoonTot     BYTE "Total SOON-TO-EXPIRE value  : Rs. %u", 0
+fmtRiskTot     BYTE "TOTAL MONEY AT RISK         : Rs. %u", 0
+fmtReorder     BYTE "%-19s Usable: %-4d Sold: %-5d -> ORDER: %d", 0
+fmtListMed     BYTE "%d.  ID %d  -  %-19s Rs. %d", 0
+fmtSalesDate   BYTE "Date               : %d", 0
+fmtSalesBills  BYTE "Number of bills    : %d", 0
+fmtSalesItems  BYTE "Items (units) sold : %d", 0
+fmtSalesTotal  BYTE "Total sales        : Rs. %u", 0
+fmtSalesMax    BYTE "Highest bill       : Rs. %u", 0
+
+.code
+
+; ====================================================================
+; PROGRAM START
+; ====================================================================
+start:
+    invoke GetModuleHandleA, 0
+    mov  hInst, eax
+
+    call LoadDataFromFile               ; silent, the window reports the result
+
+    mov  wc.cbSize, SIZEOF WNDCLASSEXA
+    mov  wc.style, 3                    ; CS_HREDRAW or CS_VREDRAW
+    mov  wc.lpfnWndProc, OFFSET WndProc
+    mov  wc.cbClsExtra, 0
+    mov  wc.cbWndExtra, 0
+    mov  eax, hInst
+    mov  wc.hInstance, eax
+    mov  wc.hIcon, 0
+    mov  wc.hIconSm, 0
+    mov  wc.lpszMenuName, 0
+    invoke LoadCursorA, 0, IDC_ARROW
+    mov  wc.hCursor, eax
+    mov  wc.hbrBackground, 16           ; COLOR_BTNFACE + 1
+    mov  wc.lpszClassName, OFFSET clsAppName
+    invoke RegisterClassExA, ADDR wc
+
+    invoke CreateWindowExA, 0, ADDR clsAppName, ADDR windowTitle, \
+           WS_MAINWINDOW or WS_VISIBLE, 40, 20, 1010, 700, 0, 0, hInst, 0
+
+MessageLoop:
+    invoke GetMessageA, ADDR msg, 0, 0, 0
+    test eax, eax
+    jz   LoopEnd
+    invoke IsDialogMessageA, hMain, ADDR msg    ; gives Tab and Enter keys
+    test eax, eax
+    jnz  MessageLoop
+    invoke TranslateMessage, ADDR msg
+    invoke DispatchMessageA, ADDR msg
+    jmp  MessageLoop
+LoopEnd:
+    invoke ExitProcess, msg.wParam
+
+
+; ====================================================================
+; WINDOW PROCEDURE : Windows calls this for every event
+; ====================================================================
+WndProc PROC USES ebx esi edi, hWnd:DWORD, uMsg:DWORD, wParam:DWORD, lParam:DWORD
+    mov  eax, uMsg
+    cmp  eax, WM_CREATE
+    je   OnCreate
+    cmp  eax, WM_COMMAND
+    je   OnCommand
+    cmp  eax, WM_DRAWITEM
+    je   OnDrawItem
+    cmp  eax, WM_MEASUREITEM
+    je   OnMeasureItem
+    cmp  eax, WM_CTLCOLORLISTBOX
+    je   OnColorList
+    cmp  eax, WM_CLOSE
+    je   OnClose
+    cmp  eax, WM_DESTROY
+    je   OnDestroy
+    invoke DefWindowProcA, hWnd, uMsg, wParam, lParam
+    ret
+
+; ---------- window is being created: build every control
+OnCreate:
+    mov  eax, hWnd
+    mov  hMain, eax
+    invoke GetStockObject, DEFAULT_GUI_FONT
+    mov  hGuiFont, eax
+    invoke GetStockObject, ANSI_FIXED_FONT
+    mov  hFixedFont, eax
+    invoke CreateSolidBrush, 0
+    mov  hBlackBrush, eax
+    invoke GetSysColorBrush, COLOR_BTNFACE_ID   ; system brush, never deleted
+    mov  hBrushFace, eax
+    invoke CreateSolidBrush, BTN_RED
+    mov  hBrushRed, eax
+    invoke CreateSolidBrush, BTN_YELLOW
+    mov  hBrushYellow, eax
+
+    ; 11 owner-drawn menu buttons, ids 101..111
+    xor  esi, esi
+CreateBtnLoop:
+    cmp  esi, 11
+    jge  CreateBtnDone
+    imul ebx, esi, 38
+    add  ebx, 10                        ; y position
+    lea  edi, [esi + 101]               ; control id
+    invoke CreateWindowExA, 0, ADDR clsButton, btnTexts[esi*4], \
+           WS_CHILD or WS_VISIBLE or WS_TABSTOP or BS_OWNERDRAW, 10, ebx, 215, 32, hWnd, edi, hInst, 0
+    mov  hBtns[esi*4], eax
+    invoke ApplyFont, eax
+    inc  esi
+    jmp  CreateBtnLoop
+CreateBtnDone:
+
+    ; three label + edit pairs
+    invoke CreateWindowExA, 0, ADDR clsStatic, ADDR emptyStr, WS_CHILD or WS_VISIBLE, \
+           245, 14, 190, 22, hWnd, 301, hInst, 0
+    mov  hLbl1, eax
+    invoke ApplyFont, eax
+    invoke CreateWindowExA, 0, ADDR clsStatic, ADDR emptyStr, WS_CHILD or WS_VISIBLE, \
+           245, 46, 190, 22, hWnd, 302, hInst, 0
+    mov  hLbl2, eax
+    invoke ApplyFont, eax
+    invoke CreateWindowExA, 0, ADDR clsStatic, ADDR emptyStr, WS_CHILD or WS_VISIBLE, \
+           245, 78, 190, 22, hWnd, 303, hInst, 0
+    mov  hLbl3, eax
+    invoke ApplyFont, eax
+
+    invoke CreateWindowExA, WS_EX_CLIENTEDGE, ADDR clsEdit, ADDR emptyStr, \
+           WS_CHILD or WS_VISIBLE or WS_TABSTOP or ES_AUTOHSCROLL, 440, 10, 220, 25, hWnd, 311, hInst, 0
+    mov  hEdit1, eax
+    invoke ApplyFont, eax
+    invoke SendMessageA, hEdit1, EM_LIMITTEXT, 30, 0
+    invoke CreateWindowExA, WS_EX_CLIENTEDGE, ADDR clsEdit, ADDR emptyStr, \
+           WS_CHILD or WS_VISIBLE or WS_TABSTOP or ES_AUTOHSCROLL, 440, 42, 220, 25, hWnd, 312, hInst, 0
+    mov  hEdit2, eax
+    invoke ApplyFont, eax
+    invoke SendMessageA, hEdit2, EM_LIMITTEXT, 30, 0
+    invoke CreateWindowExA, WS_EX_CLIENTEDGE, ADDR clsEdit, ADDR emptyStr, \
+           WS_CHILD or WS_VISIBLE or WS_TABSTOP or ES_AUTOHSCROLL, 440, 74, 220, 25, hWnd, 313, hInst, 0
+    mov  hEdit3, eax
+    invoke ApplyFont, eax
+    invoke SendMessageA, hEdit3, EM_LIMITTEXT, 30, 0
+
+    ; OK button (id 1 so the Enter key presses it) and Finish Bill button
+    invoke CreateWindowExA, 0, ADDR clsButton, ADDR txtOK, \
+           WS_CHILD or WS_VISIBLE or WS_TABSTOP or BS_DEFPUSHBUTTON, 685, 10, 110, 28, hWnd, ID_OK, hInst, 0
+    mov  hBtnOK, eax
+    invoke ApplyFont, eax
+    invoke CreateWindowExA, 0, ADDR clsButton, ADDR txtFinish, \
+           WS_CHILD or WS_TABSTOP, 685, 44, 110, 28, hWnd, ID_FINISH, hInst, 0
+    mov  hBtnFinish, eax
+    invoke ApplyFont, eax
+
+    ; instruction line and today's date label
+    invoke CreateWindowExA, 0, ADDR clsStatic, ADDR emptyStr, WS_CHILD or WS_VISIBLE, \
+           245, 108, 735, 22, hWnd, 305, hInst, 0
+    mov  hLblInfo, eax
+    invoke ApplyFont, eax
+    invoke CreateWindowExA, 0, ADDR clsStatic, ADDR emptyStr, WS_CHILD or WS_VISIBLE, \
+           14, 440, 210, 22, hWnd, 306, hInst, 0
+    mov  hLblDate, eax
+    invoke ApplyFont, eax
+
+    ; the black, colour-capable output list
+    invoke CreateWindowExA, WS_EX_CLIENTEDGE, ADDR clsListBox, ADDR emptyStr, \
+           WS_CHILD or WS_VISIBLE or WS_VSCROLL or LBS_OWNERDRAWFIXED or LBS_HASSTRINGS or LBS_NOINTEGRALHEIGHT, \
+           245, 135, 735, 505, hWnd, ID_LIST, hInst, 0
+    mov  hList, eax
+    invoke SendMessageA, hList, WM_SETFONT, hFixedFont, 1
+
+    ; menu buttons stay disabled until date + login are done
+    xor  esi, esi
+    mov  ecx, 11
+DisableLoop:
+    push ecx                            ; the API call may change ECX
+    invoke EnableWindow, hBtns[esi*4], 0
+    pop  ecx
+    inc  esi
+    loop DisableLoop
+    call StartDate
+    xor  eax, eax
+    ret
+
+; ---------- a button was pressed
+OnCommand:
+    mov  eax, wParam
+    and  eax, 0FFFFh                    ; low word = control id
+    cmp  eax, ID_OK
+    je   CmdOK
+    cmp  eax, ID_FINISH
+    je   CmdFinish
+    cmp  eax, 101
+    jl   CmdIgnore
+    cmp  eax, 111
+    jg   CmdIgnore
+    invoke HandleMenu, eax
+CmdIgnore:
+    xor  eax, eax
+    ret
+CmdOK:
+    call DoOK
+    xor  eax, eax
+    ret
+CmdFinish:
+    call FinishBill
+    xor  eax, eax
+    ret
+
+; ---------- draw one owner-drawn item (list line or menu button)
+; DRAWITEMSTRUCT offsets: CtlID 4, itemID 8, itemState 16, hwndItem 20,
+;                         hDC 24, rcItem 28 (left) 32 (top) 36 (right) 40 (bottom)
+OnDrawItem:
+    mov  esi, lParam
+    mov  eax, wParam                    ; control id
+    cmp  eax, ID_LIST
+    jne  OnDrawButton
+    mov  ebx, DWORD PTR [esi + 8]       ; item index
+    cmp  ebx, 0FFFFFFFFh
+    je   DrawDone
+    lea  eax, [esi + 28]                ; rectangle of this line
+    invoke FillRect, DWORD PTR [esi + 24], eax, hBlackBrush
+    invoke SendMessageA, hList, LB_GETITEMDATA, ebx, 0
+    invoke SetTextColor, DWORD PTR [esi + 24], eax
+    invoke SetBkMode, DWORD PTR [esi + 24], 1       ; transparent text background
+    invoke SendMessageA, hList, LB_GETTEXT, ebx, ADDR drawBuf
+    mov  edi, eax                       ; text length
+    cmp  edi, 0
+    jle  DrawDone
+    mov  eax, DWORD PTR [esi + 28]
+    add  eax, 4
+    mov  ecx, DWORD PTR [esi + 32]
+    inc  ecx
+    invoke TextOutA, DWORD PTR [esi + 24], eax, ecx, ADDR drawBuf, edi
+DrawDone:
+    mov  eax, 1
+    ret
+
+; ---------- draw a menu button: coloured face, 3D edge, text, focus box
+OnDrawButton:
+    mov  ebx, DWORD PTR [esi + 16]      ; EBX = itemState
+    mov  edi, DWORD PTR [esi + 24]      ; EDI = hDC
+    mov  edx, hBrushFace                ; normal buttons use the standard colour
+    mov  eax, wParam
+    cmp  eax, ID_LOSS
+    jne  dbNotLoss
+    mov  edx, hBrushRed                 ; Expiry Loss Report = red
+    jmp  dbFill
+dbNotLoss:
+    cmp  eax, ID_REORDER
+    jne  dbFill
+    mov  edx, hBrushYellow              ; Reorder Suggestion = yellow
+dbFill:
+    lea  eax, [esi + 28]
+    invoke FillRect, edi, eax, edx
+    mov  ecx, EDGE_RAISED
+    test ebx, ODS_SELECTED
+    jz   dbEdge
+    mov  ecx, EDGE_SUNKEN               ; pressed look
+dbEdge:
+    lea  eax, [esi + 28]
+    invoke DrawEdge, edi, eax, ecx, BF_RECT
+    add  DWORD PTR [esi + 28], 4        ; shrink the rectangle a little
+    add  DWORD PTR [esi + 32], 4
+    sub  DWORD PTR [esi + 36], 4
+    sub  DWORD PTR [esi + 40], 4
+    test ebx, ODS_FOCUS
+    jz   dbText
+    lea  eax, [esi + 28]
+    invoke DrawFocusRect, edi, eax      ; dotted box = this button has the focus
+dbText:
+    add  DWORD PTR [esi + 28], 6        ; left margin for the caption
+    mov  ecx, 0                         ; black text
+    test ebx, ODS_DISABLED
+    jz   dbColor
+    mov  ecx, BTN_TEXT_OFF              ; grey text while the button is disabled
+dbColor:
+    invoke SetBkMode, edi, 1
+    invoke SetTextColor, edi, ecx
+    invoke GetWindowTextA, DWORD PTR [esi + 20], ADDR drawBuf, 255
+    lea  ecx, [esi + 28]
+    invoke DrawTextA, edi, ADDR drawBuf, eax, ecx, DT_LEFT_VCENTER
+    mov  eax, 1
+    ret
+
+; ---------- every list line is 16 pixels high
+OnMeasureItem:
+    mov  eax, lParam
+    mov  DWORD PTR [eax + 16], 16
+    mov  eax, 1
+    ret
+
+; ---------- empty part of the list is painted black too
+OnColorList:
+    mov  eax, hBlackBrush
+    ret
+
+; ---------- window is closing: save first
+OnClose:
+    cmp  loggedIn, 0
+    je   CloseNow
+    call FlushOpenBill
+    call SaveQuiet
+CloseNow:
+    invoke DefWindowProcA, hWnd, uMsg, wParam, lParam
+    ret
+
+OnDestroy:
+    invoke PostQuitMessage, 0
+    xor  eax, eax
+    ret
+WndProc ENDP
+
+
+; ====================================================================
+; SMALL HELPERS (text, messages, fonts)
+; ====================================================================
+
+ApplyFont PROC USES eax, h:DWORD
+    invoke SendMessageA, h, WM_SETFONT, hGuiFont, 1
+    ret
+ApplyFont ENDP
+
+; Adds one line to the output list in the given colour
+PutLine PROC USES eax ecx edx, pText:DWORD, color:DWORD
+    invoke SendMessageA, hList, LB_ADDSTRING, 0, pText
+    cmp  eax, 0FFFFFFFFh                ; LB_ERR
+    je   plDone
+    invoke SendMessageA, hList, LB_SETITEMDATA, eax, color
+plDone:
+    ret
+PutLine ENDP
+
+ClearList PROC USES eax ecx edx
+    invoke SendMessageA, hList, LB_RESETCONTENT, 0, 0
+    ret
+ClearList ENDP
+
+ShowError PROC USES eax ecx edx, pMsg:DWORD
+    invoke MessageBoxA, hMain, pMsg, ADDR titleError, MB_OK or MB_ICONERROR
+    ret
+ShowError ENDP
+
+ShowInfo PROC USES eax ecx edx, pMsg:DWORD
+    invoke MessageBoxA, hMain, pMsg, ADDR titleInfo, MB_OK or MB_ICONINFORMATION
+    ret
+ShowInfo ENDP
+
+; Copies a 0-terminated string
+StrCopy PROC USES eax esi edi, pSrc:DWORD, pDst:DWORD
+    mov  esi, pSrc
+    mov  edi, pDst
+scpNext:
+    mov  al, [esi]
+    mov  [edi], al
+    inc  esi
+    inc  edi
+    test al, al
+    jnz  scpNext
+    ret
+StrCopy ENDP
+
+; Compares two strings. Returns EAX = -1 (A < B), 0 (equal), 1 (A > B).
+; fold = 1 ignores upper/lower case.
+StrCompare PROC USES ebx esi edi, pA:DWORD, pB:DWORD, fold:DWORD
+    mov  esi, pA
+    mov  edi, pB
+scLoop:
+    movzx eax, BYTE PTR [esi]
+    movzx ebx, BYTE PTR [edi]
+    cmp  fold, 0
+    je   scCompare
+    cmp  al, 'a'                        ; turn lower case into upper case
+    jb   scFoldB
+    cmp  al, 'z'
+    ja   scFoldB
+    sub  al, 20h
+scFoldB:
+    cmp  bl, 'a'
+    jb   scCompare
+    cmp  bl, 'z'
+    ja   scCompare
+    sub  bl, 20h
+scCompare:
+    cmp  eax, ebx
+    jb   scLess
+    ja   scGreater
+    test eax, eax                       ; equal and both ended
+    jz   scEqual
+    inc  esi
+    inc  edi
+    jmp  scLoop
+scLess:
+    mov  eax, -1
+    ret
+scGreater:
+    mov  eax, 1
+    ret
+scEqual:
+    xor  eax, eax
+    ret
+StrCompare ENDP
+
+; Reads a whole number from an edit box. Digits only, at most 9 of them.
+; Spaces before or after the number are ignored; anything else is rejected.
+; Returns EAX = value, EDX = 1 if it was a valid number, 0 if not.
+GetNum PROC USES ebx ecx esi, hEd:DWORD
+    invoke GetWindowTextA, hEd, ADDR numBuf, 31
+    mov  esi, OFFSET numBuf
+    xor  eax, eax                       ; value
+    xor  ecx, ecx                       ; digits seen
+    xor  ebx, ebx                       ; 1 once a space came after the digits
+gnNext:
+    movzx edx, BYTE PTR [esi]
+    test edx, edx
+    jz   gnEnd
+    cmp  edx, ' '
+    jne  gnDigit
+    test ecx, ecx
+    jz   gnSkip                         ; leading space is ignored
+    mov  ebx, 1                         ; trailing space: no more digits allowed
+    jmp  gnSkip
+gnDigit:
+    cmp  edx, '0'
+    jb   gnBad
+    cmp  edx, '9'
+    ja   gnBad
+    test ebx, ebx
+    jnz  gnBad                          ; digit after a space (like "1 2")
+    sub  edx, '0'
+    imul eax, eax, 10
+    add  eax, edx
+    inc  ecx
+    cmp  ecx, 9
+    ja   gnBad
+gnSkip:
+    inc  esi
+    jmp  gnNext
+gnEnd:
+    test ecx, ecx
+    jz   gnBad
+    mov  edx, 1
+    ret
+gnBad:
+    xor  eax, eax
+    xor  edx, edx
+    ret
+GetNum ENDP
+
+; Reads a number and checks minV..maxV. On error shows pMsg and returns EDX = 0.
+GetRangeField PROC hEd:DWORD, minV:DWORD, maxV:DWORD, pMsg:DWORD
+    invoke GetNum, hEd
+    test edx, edx
+    jz   grBad
+    cmp  eax, minV
+    jl   grBad
+    cmp  eax, maxV
+    jg   grBad
+    mov  edx, 1
+    ret
+grBad:
+    invoke ShowError, pMsg
+    invoke SetFocus, hEd
+    xor  eax, eax
+    xor  edx, edx
+    ret
+GetRangeField ENDP
+
+; Shows or hides one label + edit pair. show = 0 hides, 5 shows.
+SetField PROC hLbl:DWORD, hEd:DWORD, pText:DWORD, show:DWORD
+    invoke ShowWindow, hLbl, show
+    invoke ShowWindow, hEd, show
+    cmp  show, 0
+    je   sfDone
+    invoke SetWindowTextA, hLbl, pText
+    invoke SetWindowTextA, hEd, ADDR emptyStr
+sfDone:
+    ret
+SetField ENDP
+
+; Sets up the input area: title line, labels and how many boxes are shown (0 to 3)
+ShowForm PROC USES ebx, pTitle:DWORD, p1:DWORD, p2:DWORD, p3:DWORD, nFields:DWORD
+    invoke SetWindowTextA, hLblInfo, pTitle
+
+    mov  ebx, SW_HIDE
+    cmp  nFields, 1
+    jl   sf1
+    mov  ebx, SW_SHOW
+sf1:
+    invoke SetField, hLbl1, hEdit1, p1, ebx
+
+    mov  ebx, SW_HIDE
+    cmp  nFields, 2
+    jl   sf2
+    mov  ebx, SW_SHOW
+sf2:
+    invoke SetField, hLbl2, hEdit2, p2, ebx
+
+    mov  ebx, SW_HIDE
+    cmp  nFields, 3
+    jl   sf3
+    mov  ebx, SW_SHOW
+sf3:
+    invoke SetField, hLbl3, hEdit3, p3, ebx
+
+    mov  ebx, SW_HIDE
+    cmp  nFields, 0
+    je   sf4
+    mov  ebx, SW_SHOW
+sf4:
+    invoke ShowWindow, hBtnOK, ebx
+    invoke ShowWindow, hBtnFinish, SW_HIDE
+    cmp  nFields, 0
+    je   sfEnd
+    invoke SetFocus, hEdit1
+sfEnd:
+    ret
+ShowForm ENDP
+
+; Clears the three boxes and puts the cursor in the first one
+ResetInputs PROC USES eax ecx edx
+    invoke SetWindowTextA, hEdit1, ADDR emptyStr
+    invoke SetWindowTextA, hEdit2, ADDR emptyStr
+    invoke SetWindowTextA, hEdit3, ADDR emptyStr
+    invoke SetFocus, hEdit1
+    ret
+ResetInputs ENDP
+
+
+; ====================================================================
+; START-UP STEPS : date, then login, then ready
+; ====================================================================
+
+StartDate PROC USES eax ecx edx
+    mov  curMode, MODE_DATE
+    invoke ShowForm, ADDR infoDate, ADDR lblDateField, ADDR emptyStr, ADDR emptyStr, 1
+    call ClearList
+    invoke PutLine, ADDR msgWelcome, CLR_CYAN
+    invoke PutLine, ADDR emptyStr, CLR_WHITE
+    cmp  loadStatus, 1
+    je   sdLoaded
+    cmp  loadStatus, 2
+    je   sdDamaged
+    invoke PutLine, ADDR msgNoFile, CLR_YELLOW
+    ret
+sdLoaded:
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtLoaded, medCount, batCount
+    invoke PutLine, ADDR lineBuf, CLR_GREEN
+    ret
+sdDamaged:
+    invoke PutLine, ADDR msgBadFile, CLR_RED
+    ret
+StartDate ENDP
+
+OkDate PROC USES ebx esi
+    invoke GetNum, hEdit1
+    test edx, edx
+    jz   odBad
+    mov  esi, eax
+    invoke IsValidDate, esi
+    cmp  eax, 1
+    jne  odBad
+    mov  todayDate, esi
+    cmp  esi, lastSaleDate              ; a new day starts new sales totals
+    je   odSameDay
+    mov  billCount, 0
+    mov  itemsSold, 0
+    mov  totalSales, 0
+    mov  maxBill, 0
+    mov  lastSaleDate, esi
+odSameDay:
+    call StartLogin
+    ret
+odBad:
+    invoke ShowError, ADDR msgBadDate
+    invoke SetFocus, hEdit1
+    ret
+OkDate ENDP
+
+StartLogin PROC USES eax ecx edx
+    mov  curMode, MODE_LOGIN
+    mov  loginTries, 0
+    invoke ShowForm, ADDR infoLogin, ADDR lblPassField, ADDR emptyStr, ADDR emptyStr, 1
+    invoke SendMessageA, hEdit1, EM_SETPASSWORDCHAR, '*', 0     ; show stars
+    ret
+StartLogin ENDP
+
+OkLogin PROC USES ebx
+    invoke GetWindowTextA, hEdit1, ADDR passBuf, 31
+    invoke StrCompare, ADDR passBuf, ADDR correctPassword, 0    ; case matters
+    test eax, eax
+    jz   olGood
+    inc  loginTries
+    mov  ebx, MAX_ATTEMPTS
+    sub  ebx, loginTries                ; attempts left
+    cmp  ebx, 0
+    jle  olLocked
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtWrongPass, ebx
+    invoke ShowError, ADDR lineBuf
+    invoke SetWindowTextA, hEdit1, ADDR emptyStr
+    invoke SetFocus, hEdit1
+    ret
+olLocked:
+    invoke ShowError, ADDR msgTooMany
+    invoke DestroyWindow, hMain
+    ret
+olGood:
+    invoke SendMessageA, hEdit1, EM_SETPASSWORDCHAR, 0, 0       ; stars off
+    call EnterReady
+    ret
+OkLogin ENDP
+
+EnterReady PROC USES esi ecx
+    mov  loggedIn, 1
+    mov  curMode, MODE_NONE
+    xor  esi, esi
+    mov  ecx, 11                        ; 11 menu buttons
+erLoop:
+    push ecx                            ; the API call may change ECX
+    invoke EnableWindow, hBtns[esi*4], 1
+    pop  ecx
+    inc  esi
+    loop erLoop
+    invoke ShowForm, ADDR infoReady, ADDR emptyStr, ADDR emptyStr, ADDR emptyStr, 0
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtToday, todayDate
+    invoke SetWindowTextA, hLblDate, ADDR lineBuf
+    call ClearList
+    invoke PutLine, ADDR msgLoginOk, CLR_GREEN
+    ret
+EnterReady ENDP
+
+
+; ====================================================================
+; MENU : which button was pressed
+; ====================================================================
+HandleMenu PROC USES ebx, id:DWORD
+    mov  ebx, id
+    cmp  billItemCount, 0               ; an open bill blocks other modules
+    je   hmGo
+    cmp  ebx, ID_SELL
+    je   hmGo
+    invoke ShowInfo, ADDR msgBillOpen
+    ret
+hmGo:
+    cmp  ebx, 101
+    je   hm1
+    cmp  ebx, 102
+    je   hm2
+    cmp  ebx, 103
+    je   hm3
+    cmp  ebx, 104
+    je   hm4
+    cmp  ebx, 105
+    je   hm5
+    cmp  ebx, 106
+    je   hm6
+    cmp  ebx, 107
+    je   hm7
+    cmp  ebx, 108
+    je   hm8
+    cmp  ebx, 109
+    je   hm9
+    cmp  ebx, 110
+    je   hm10
+    cmp  ebx, 111
+    je   hm11
+    ret
+hm1:
+    call StartAddMed
+    ret
+hm2:
+    call StartAddBatch
+    ret
+hm3:
+    call ViewStock
+    ret
+hm4:
+    call StartSearch
+    ret
+hm5:
+    call StartUpdateDelete
+    ret
+hm6:
+    call StartSort
+    ret
+hm7:
+    call StartSell
+    ret
+hm8:
+    call ExpiryLossReport
+    ret
+hm9:
+    call ReorderSuggestion
+    ret
+hm10:
+    call DailySalesReport
+    ret
+hm11:
+    call SaveAndExit
+    ret
+HandleMenu ENDP
+
+; OK button: do the job that belongs to the current mode
+DoOK PROC
+    mov  eax, curMode
+    cmp  eax, MODE_DATE
+    je   dkDate
+    cmp  eax, MODE_LOGIN
+    je   dkLogin
+    cmp  eax, MODE_ADD_MED
+    je   dkAddMed
+    cmp  eax, MODE_ADD_BATCH
+    je   dkAddBatch
+    cmp  eax, MODE_SEARCH_ID
+    je   dkSearchId
+    cmp  eax, MODE_SEARCH_NAME
+    je   dkSearchName
+    cmp  eax, MODE_UPDATE
+    je   dkUpdate
+    cmp  eax, MODE_DELETE
+    je   dkDelete
+    cmp  eax, MODE_SELL
+    je   dkSell
+    ret
+dkDate:
+    call OkDate
+    ret
+dkLogin:
+    call OkLogin
+    ret
+dkAddMed:
+    call OkAddMed
+    ret
+dkAddBatch:
+    call OkAddBatch
+    ret
+dkSearchId:
+    call OkSearchId
+    ret
+dkSearchName:
+    call OkSearchName
+    ret
+dkUpdate:
+    call OkUpdate
+    ret
+dkDelete:
+    call OkDelete
+    ret
+dkSell:
+    call OkSell
+    ret
+DoOK ENDP
+
+
+; ====================================================================
+; DATE HELPERS
+; ====================================================================
+
+; Checks a YYYYMMDD date (2000-01-01 .. 2100-12-31, leap years respected).
+; Returns EAX = 1 (valid) or 0 (invalid).
+IsValidDate PROC USES ebx ecx edx, dateVal:DWORD
+    mov  eax, dateVal
+    cmp  eax, 20000101
+    jl   ivBad
+    cmp  eax, 21001231
+    jg   ivBad
+    xor  edx, edx
+    mov  ecx, 10000
+    div  ecx                            ; EAX = year, EDX = MMDD
+    mov  ebx, eax                       ; EBX = year
+    mov  eax, edx
+    xor  edx, edx
+    mov  ecx, 100
+    div  ecx                            ; EAX = month, EDX = day
+    cmp  eax, 1
+    jl   ivBad
+    cmp  eax, 12
+    jg   ivBad
+    cmp  edx, 1
+    jl   ivBad
+    movzx ecx, BYTE PTR monthDays[eax - 1]
+    cmp  edx, ecx
+    jg   ivBad
+    cmp  eax, 2                         ; only 29 February needs the leap test
+    jne  ivGood
+    cmp  edx, 29
+    jne  ivGood
+    mov  eax, ebx                       ; year divisible by 4 ?
+    xor  edx, edx
+    mov  ecx, 4
+    div  ecx
+    test edx, edx
+    jnz  ivBad
+    mov  eax, ebx                       ; ...and not by 100 -> leap year
+    xor  edx, edx
+    mov  ecx, 100
+    div  ecx
+    test edx, edx
+    jnz  ivGood
+    mov  eax, ebx                       ; divisible by 100: leap only if by 400
+    xor  edx, edx
+    mov  ecx, 400
+    div  ecx
+    test edx, edx
+    jnz  ivBad
+ivGood:
+    mov  eax, 1
+    ret
+ivBad:
+    xor  eax, eax
+    ret
+IsValidDate ENDP
+
+; YYYYMMDD -> simple day number (every month = 31 days)
+DateToDays PROC USES ebx ecx edx, dateVal:DWORD
+    mov  eax, dateVal
+    xor  edx, edx
+    mov  ebx, 10000
+    div  ebx                            ; EAX = year, EDX = MMDD
+    imul ecx, eax, 372                  ; 12 months * 31 days
+    mov  eax, edx
+    xor  edx, edx
+    mov  ebx, 100
+    div  ebx                            ; EAX = month, EDX = day
+    imul eax, eax, 31
+    add  eax, edx
+    add  eax, ecx
+    ret
+DateToDays ENDP
+
+; Returns EAX = 0 usable, 1 expires within 30 days, 2 expired
+GetBatchStatus PROC USES ebx, expiry:DWORD
+    mov  eax, expiry
+    cmp  eax, todayDate
+    jl   gsExpired
+    invoke DateToDays, eax
+    mov  ebx, eax
+    invoke DateToDays, todayDate
+    sub  ebx, eax                       ; days left
+    cmp  ebx, SOON_DAYS
+    jle  gsSoon
+    mov  eax, STATUS_OK
+    ret
+gsSoon:
+    mov  eax, STATUS_SOON
+    ret
+gsExpired:
+    mov  eax, STATUS_EXPIRED
+    ret
+GetBatchStatus ENDP
+
+
+; ====================================================================
+; ARRAY HELPERS
+; ====================================================================
+
+; EAX = medicine index  ->  EDX = address of its name (index * 20)
+GetNameAddr PROC USES eax
+    imul eax, NAME_SIZE
+    mov  edx, OFFSET medName
+    add  edx, eax
+    ret
+GetNameAddr ENDP
+
+; Returns EAX = index of the medicine with this ID, or -1
+FindMedicineById PROC USES esi, idVal:DWORD
+    xor  esi, esi
+fiLoop:
+    cmp  esi, medCount
+    jge  fiNone
+    mov  eax, idVal
+    cmp  medID[esi*4], eax
+    je   fiFound
+    inc  esi
+    jmp  fiLoop
+fiNone:
+    mov  eax, -1
+    ret
+fiFound:
+    mov  eax, esi
+    ret
+FindMedicineById ENDP
+
+; Returns EAX = index of the medicine with this name (ignores case), or -1
+FindMedicineByName PROC USES edx esi, pName:DWORD
+    xor  esi, esi
+fnLoop:
+    cmp  esi, medCount
+    jge  fnNone
+    mov  eax, esi
+    call GetNameAddr                    ; EDX = name of medicine ESI
+    invoke StrCompare, edx, pName, 1
+    test eax, eax
+    jz   fnFound
+    inc  esi
+    jmp  fnLoop
+fnNone:
+    mov  eax, -1
+    ret
+fnFound:
+    mov  eax, esi
+    ret
+FindMedicineByName ENDP
+
+; Returns EAX = total quantity in the non-expired batches of a medicine
+GetUsableStock PROC USES ebx ecx edx esi, medIdx:DWORD
+    xor  ebx, ebx
+    xor  esi, esi
+guLoop:
+    cmp  esi, batCount
+    jge  guDone
+    mov  eax, medIdx
+    cmp  batMed[esi*4], eax
+    jne  guNext
+    invoke GetBatchStatus, batExpiry[esi*4]
+    cmp  eax, STATUS_EXPIRED
+    je   guNext
+    add  ebx, batQty[esi*4]
+guNext:
+    inc  esi
+    jmp  guLoop
+guDone:
+    mov  eax, ebx
+    ret
+GetUsableStock ENDP
+
+; Returns EAX = batch index with the earliest expiry date that is not expired
+; and not empty, or -1 if there is none
+FindEarliestBatch PROC USES ebx ecx edx esi edi, medIdx:DWORD
+    mov  edi, -1                        ; best batch so far
+    mov  edx, 99999999                  ; its expiry date
+    xor  esi, esi
+feLoop:
+    cmp  esi, batCount
+    jge  feDone
+    mov  eax, medIdx
+    cmp  batMed[esi*4], eax
+    jne  feNext
+    cmp  batQty[esi*4], 0
+    je   feNext
+    mov  eax, batExpiry[esi*4]
+    cmp  eax, todayDate                 ; expired batches are ignored
+    jl   feNext
+    cmp  eax, edx
+    jge  feNext
+    mov  edx, eax
+    mov  edi, esi
+feNext:
+    inc  esi
+    jmp  feLoop
+feDone:
+    mov  eax, edi
+    ret
+FindEarliestBatch ENDP
+
+; Removes one batch by shifting the later ones down
+RemoveBatchAt PROC USES eax ebx ecx esi, idx:DWORD
+    mov  esi, idx
+rbLoop:
+    mov  ebx, esi
+    inc  ebx
+    cmp  ebx, batCount
+    jge  rbDone
+    mov  ecx, batMed[ebx*4]
+    mov  batMed[esi*4], ecx
+    mov  ecx, batQty[ebx*4]
+    mov  batQty[esi*4], ecx
+    mov  ecx, batExpiry[ebx*4]
+    mov  batExpiry[esi*4], ecx
+    inc  esi
+    jmp  rbLoop
+rbDone:
+    dec  batCount
+    ret
+RemoveBatchAt ENDP
+
+; Deletes every batch whose quantity is 0
+CleanEmptyBatches PROC USES eax esi
+    xor  esi, esi
+ceLoop:
+    cmp  esi, batCount
+    jge  ceDone
+    cmp  batQty[esi*4], 0
+    jne  ceKeep
+    invoke RemoveBatchAt, esi
+    jmp  ceLoop                         ; next batch slid into this slot
+ceKeep:
+    inc  esi
+    jmp  ceLoop
+ceDone:
+    ret
+CleanEmptyBatches ENDP
+
+; Removes one medicine record by shifting the later ones down
+RemoveMedicineAt PROC USES eax ebx ecx edx esi edi, idx:DWORD
+    mov  esi, idx
+rmLoop:
+    mov  ebx, esi
+    inc  ebx
+    cmp  ebx, medCount
+    jge  rmDone
+    mov  ecx, medID[ebx*4]
+    mov  medID[esi*4], ecx
+    mov  ecx, medPrice[ebx*4]
+    mov  medPrice[esi*4], ecx
+    mov  ecx, medSold[ebx*4]
+    mov  medSold[esi*4], ecx
+    mov  eax, ebx
+    call GetNameAddr
+    mov  edi, edx                       ; source name
+    mov  eax, esi
+    call GetNameAddr                    ; EDX = target name
+    invoke StrCopy, edi, edx
+    inc  esi
+    jmp  rmLoop
+rmDone:
+    dec  medCount
+    ret
+RemoveMedicineAt ENDP
+
+; Deletes a medicine and all of its batches. Batches of later medicines
+; get their medicine index lowered by one.
+DeleteMedicine PROC USES eax esi edi, idx:DWORD
+    mov  edi, idx
+    xor  esi, esi
+dmBatchLoop:
+    cmp  esi, batCount
+    jge  dmBatchesDone
+    cmp  batMed[esi*4], edi
+    jne  dmKeepBatch
+    invoke RemoveBatchAt, esi
+    jmp  dmBatchLoop
+dmKeepBatch:
+    inc  esi
+    jmp  dmBatchLoop
+dmBatchesDone:
+    invoke RemoveMedicineAt, edi
+    xor  esi, esi
+dmFixLoop:
+    cmp  esi, batCount
+    jge  dmFixDone
+    cmp  batMed[esi*4], edi
+    jle  dmSkipFix
+    dec  batMed[esi*4]
+dmSkipFix:
+    inc  esi
+    jmp  dmFixLoop
+dmFixDone:
+    ret
+DeleteMedicine ENDP
+
+
+; ====================================================================
+; 1. ADD MEDICINE
+; ====================================================================
+StartAddMed PROC USES eax ecx edx
+    cmp  medCount, MAX_MEDICINES
+    jl   samRoom
+    invoke ShowError, ADDR msgMedFull
+    ret
+samRoom:
+    mov  curMode, MODE_ADD_MED
+    invoke ShowForm, ADDR infoAddMed, ADDR lblMedId, ADDR lblMedName, ADDR lblPrice, 3
+    call ClearList
+    ret
+StartAddMed ENDP
+
+OkAddMed PROC USES ebx esi edi
+    cmp  medCount, MAX_MEDICINES
+    jl   oamRoom
+    invoke ShowError, ADDR msgMedFull
+    ret
+oamRoom:
+    invoke GetRangeField, hEdit1, 1, MAX_ID, ADDR msgBadId
+    test edx, edx
+    jz   oamEnd
+    mov  ebx, eax                       ; EBX = new ID
+    invoke FindMedicineById, ebx
+    cmp  eax, -1
+    je   oamIdFree
+    invoke ShowError, ADDR msgDuplicate
+    invoke SetFocus, hEdit1
+    ret
+oamIdFree:
+    invoke GetWindowTextA, hEdit2, ADDR nameBuf, 63
+    cmp  eax, 1
+    jl   oamBadName
+    cmp  eax, NAME_SIZE - 1
+    jg   oamBadName
+    invoke FindMedicineByName, ADDR nameBuf     ; two medicines may not share a name
+    cmp  eax, -1
+    je   oamNameFree
+    invoke ShowError, ADDR msgDupName
+    invoke SetFocus, hEdit2
+    ret
+oamNameFree:
+    invoke GetRangeField, hEdit3, 1, MAX_PRICE, ADDR msgBadPrice
+    test edx, edx
+    jz   oamEnd
+    mov  edi, eax                       ; EDI = price
+
+    mov  esi, medCount                  ; store at index = medCount
+    mov  medID[esi*4], ebx
+    mov  medPrice[esi*4], edi
+    mov  medSold[esi*4], 0
+    mov  eax, esi
+    call GetNameAddr
+    invoke StrCopy, ADDR nameBuf, edx
+    inc  medCount
+    call AutoSave
+    call ResetInputs
+    invoke ShowInfo, ADDR msgMedAdded
+    ret
+oamBadName:
+    invoke ShowError, ADDR msgBadName
+    invoke SetFocus, hEdit2
+oamEnd:
+    ret
+OkAddMed ENDP
+
+
+; ====================================================================
+; 2. ADD BATCH / RESTOCK
+; ====================================================================
+StartAddBatch PROC USES eax ecx edx
+    cmp  medCount, 0
+    jne  sabHasMeds
+    invoke ShowError, ADDR msgNoMeds
+    ret
+sabHasMeds:
+    cmp  batCount, MAX_BATCHES
+    jl   sabRoom
+    invoke ShowError, ADDR msgBatchFull
+    ret
+sabRoom:
+    mov  curMode, MODE_ADD_BATCH
+    invoke ShowForm, ADDR infoAddBatch, ADDR lblMedId, ADDR lblQty, ADDR lblExpiry, 3
+    call ClearList
+    ret
+StartAddBatch ENDP
+
+OkAddBatch PROC USES ebx esi edi
+    cmp  batCount, MAX_BATCHES
+    jl   oabRoom
+    invoke ShowError, ADDR msgBatchFull
+    ret
+oabRoom:
+    invoke GetRangeField, hEdit1, 1, MAX_ID, ADDR msgBadId
+    test edx, edx
+    jz   oabEnd
+    invoke FindMedicineById, eax
+    cmp  eax, -1
+    jne  oabFound
+    invoke ShowError, ADDR msgNotFound
+    invoke SetFocus, hEdit1
+    ret
+oabFound:
+    mov  ebx, eax                       ; EBX = medicine index
+    invoke GetRangeField, hEdit2, 1, MAX_QTY, ADDR msgBadQty
+    test edx, edx
+    jz   oabEnd
+    mov  edi, eax                       ; EDI = quantity
+    invoke GetNum, hEdit3
+    test edx, edx
+    jz   oabBadDate
+    mov  esi, eax                       ; ESI = expiry date
+    invoke IsValidDate, esi
+    cmp  eax, 1
+    jne  oabBadDate
+
+    mov  eax, batCount                  ; store at index = batCount
+    mov  batMed[eax*4], ebx
+    mov  batQty[eax*4], edi
+    mov  batExpiry[eax*4], esi
+    inc  batCount
+    call AutoSave
+    call ResetInputs
+    invoke GetBatchStatus, esi
+    cmp  eax, STATUS_EXPIRED
+    je   oabOld
+    invoke ShowInfo, ADDR msgBatchAdded
+    ret
+oabOld:
+    invoke ShowInfo, ADDR msgBatchOld
+    ret
+oabBadDate:
+    invoke ShowError, ADDR msgBadDate
+    invoke SetFocus, hEdit3
+oabEnd:
+    ret
+OkAddBatch ENDP
+
+
+; ====================================================================
+; 3. VIEW STOCK
+; ====================================================================
+
+; Prints one medicine and its batches (red = expired, yellow = soon)
+ShowMedicineDetails PROC USES ebx esi edi, idx:DWORD
+    LOCAL shown:DWORD
+    mov  shown, 0
+    mov  esi, idx
+    invoke GetUsableStock, esi
+    mov  edi, eax                       ; EDI = usable stock
+    mov  eax, esi
+    call GetNameAddr                    ; EDX = name
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtMed, medID[esi*4], edx, medPrice[esi*4], edi
+    invoke PutLine, ADDR lineBuf, CLR_CYAN
+
+    xor  ebx, ebx                       ; EBX = batch index
+sdLoop:
+    cmp  ebx, batCount
+    jge  sdAfter
+    cmp  batMed[ebx*4], esi
+    jne  sdNext
+    inc  shown
+    invoke GetBatchStatus, batExpiry[ebx*4]
+    mov  edx, OFFSET tagOk
+    mov  edi, CLR_WHITE
+    cmp  eax, STATUS_EXPIRED
+    jne  sdNotExpired
+    mov  edx, OFFSET tagExpired
+    mov  edi, CLR_RED
+    jmp  sdPrint
+sdNotExpired:
+    cmp  eax, STATUS_SOON
+    jne  sdPrint
+    mov  edx, OFFSET tagSoon
+    mov  edi, CLR_YELLOW
+sdPrint:
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtBatch, batQty[ebx*4], batExpiry[ebx*4], edx
+    invoke PutLine, ADDR lineBuf, edi
+sdNext:
+    inc  ebx
+    jmp  sdLoop
+sdAfter:
+    cmp  shown, 0
+    jne  sdDone
+    invoke PutLine, ADDR msgNoBatches, CLR_GRAY
+sdDone:
+    ret
+ShowMedicineDetails ENDP
+
+ViewStock PROC USES esi
+    mov  curMode, MODE_NONE
+    invoke ShowForm, ADDR infoView, ADDR emptyStr, ADDR emptyStr, ADDR emptyStr, 0
+    call ClearList
+    invoke PutLine, ADDR msgStockHead, CLR_CYAN
+    cmp  medCount, 0
+    jne  vsHas
+    invoke PutLine, ADDR msgNoMedsLine, CLR_YELLOW
+    ret
+vsHas:
+    xor  esi, esi
+vsLoop:
+    cmp  esi, medCount
+    jge  vsDone
+    invoke ShowMedicineDetails, esi
+    invoke PutLine, ADDR emptyStr, CLR_WHITE
+    inc  esi
+    jmp  vsLoop
+vsDone:
+    ret
+ViewStock ENDP
+
+
+; ====================================================================
+; 4. SEARCH
+; ====================================================================
+StartSearch PROC USES eax ecx edx
+    invoke MessageBoxA, hMain, ADDR askSearch, ADDR titleAsk, MB_YESNOCANCEL or MB_ICONQUESTION
+    cmp  eax, IDYES
+    je   ssById
+    cmp  eax, IDNO
+    je   ssByName
+    ret                                 ; cancelled
+ssById:
+    mov  curMode, MODE_SEARCH_ID
+    invoke ShowForm, ADDR infoSearchId, ADDR lblMedId, ADDR emptyStr, ADDR emptyStr, 1
+    call ClearList
+    ret
+ssByName:
+    mov  curMode, MODE_SEARCH_NAME
+    invoke ShowForm, ADDR infoSearchName, ADDR lblMedName, ADDR emptyStr, ADDR emptyStr, 1
+    call ClearList
+    ret
+StartSearch ENDP
+
+OkSearchId PROC USES ebx
+    invoke GetRangeField, hEdit1, 1, MAX_ID, ADDR msgBadId
+    test edx, edx
+    jz   osiEnd
+    invoke FindMedicineById, eax
+    cmp  eax, -1
+    jne  osiFound
+    invoke ShowError, ADDR msgNotFound
+    ret
+osiFound:
+    mov  ebx, eax
+    call ClearList
+    invoke ShowMedicineDetails, ebx
+osiEnd:
+    ret
+OkSearchId ENDP
+
+OkSearchName PROC USES ebx
+    invoke GetWindowTextA, hEdit1, ADDR nameBuf, 63
+    cmp  eax, 1
+    jl   osnBad
+    invoke FindMedicineByName, ADDR nameBuf
+    cmp  eax, -1
+    jne  osnFound
+    invoke ShowError, ADDR msgNotFound
+    ret
+osnFound:
+    mov  ebx, eax
+    call ClearList
+    invoke ShowMedicineDetails, ebx
+    ret
+osnBad:
+    invoke ShowError, ADDR msgBadName
+    ret
+OkSearchName ENDP
+
+
+; ====================================================================
+; 5. UPDATE PRICE / DELETE MEDICINE
+; ====================================================================
+StartUpdateDelete PROC USES eax ecx edx
+    cmp  medCount, 0
+    jne  sudHas
+    invoke ShowError, ADDR msgNoMeds
+    ret
+sudHas:
+    invoke MessageBoxA, hMain, ADDR askUpdateDel, ADDR titleAsk, MB_YESNOCANCEL or MB_ICONQUESTION
+    cmp  eax, IDYES
+    je   sudUpdate
+    cmp  eax, IDNO
+    je   sudDelete
+    ret
+sudUpdate:
+    mov  curMode, MODE_UPDATE
+    invoke ShowForm, ADDR infoUpdate, ADDR lblMedId, ADDR lblNewPrice, ADDR emptyStr, 2
+    call ClearList
+    ret
+sudDelete:
+    mov  curMode, MODE_DELETE
+    invoke ShowForm, ADDR infoDelete, ADDR lblMedId, ADDR emptyStr, ADDR emptyStr, 1
+    call ClearList
+    ret
+StartUpdateDelete ENDP
+
+OkUpdate PROC USES ebx esi
+    invoke GetRangeField, hEdit1, 1, MAX_ID, ADDR msgBadId
+    test edx, edx
+    jz   ouEnd
+    invoke FindMedicineById, eax
+    cmp  eax, -1
+    jne  ouFound
+    invoke ShowError, ADDR msgNotFound
+    invoke SetFocus, hEdit1
+    ret
+ouFound:
+    mov  ebx, eax
+    invoke GetRangeField, hEdit2, 1, MAX_PRICE, ADDR msgBadPrice
+    test edx, edx
+    jz   ouEnd
+    mov  medPrice[ebx*4], eax
+    call AutoSave
+    call ClearList
+    invoke ShowMedicineDetails, ebx     ; show the new price
+    call ResetInputs
+    invoke ShowInfo, ADDR msgPriceDone
+ouEnd:
+    ret
+OkUpdate ENDP
+
+OkDelete PROC USES ebx
+    invoke GetRangeField, hEdit1, 1, MAX_ID, ADDR msgBadId
+    test edx, edx
+    jz   odlEnd
+    invoke FindMedicineById, eax
+    cmp  eax, -1
+    jne  odlFound
+    invoke ShowError, ADDR msgNotFound
+    invoke SetFocus, hEdit1
+    ret
+odlFound:
+    mov  ebx, eax
+    call ClearList
+    invoke ShowMedicineDetails, ebx     ; show what will disappear
+    invoke MessageBoxA, hMain, ADDR askConfirmDel, ADDR titleAsk, MB_YESNO or MB_ICONQUESTION
+    cmp  eax, IDYES
+    jne  odlEnd
+    invoke DeleteMedicine, ebx
+    call AutoSave
+    call ClearList
+    call ResetInputs
+    invoke ShowInfo, ADDR msgDeleted
+odlEnd:
+    ret
+OkDelete ENDP
+
+
+; ====================================================================
+; 6. SORT (bubble sort)
+; ====================================================================
+
+; Returns EAX = -1, 0 or 1 comparing the names of medicine i and j
+CompareMedNames PROC USES ebx edx, i:DWORD, j:DWORD
+    mov  eax, i
+    call GetNameAddr
+    mov  ebx, edx
+    mov  eax, j
+    call GetNameAddr
+    invoke StrCompare, ebx, edx, 1
+    ret
+CompareMedNames ENDP
+
+; Swaps medicine i and j completely and fixes the batch links
+SwapMedicines PROC USES eax ebx ecx edx esi edi, i:DWORD, j:DWORD
+    mov  esi, i
+    mov  edi, j
+
+    mov  eax, medID[esi*4]
+    xchg eax, medID[edi*4]
+    mov  medID[esi*4], eax
+
+    mov  eax, medPrice[esi*4]
+    xchg eax, medPrice[edi*4]
+    mov  medPrice[esi*4], eax
+
+    mov  eax, medSold[esi*4]
+    xchg eax, medSold[edi*4]
+    mov  medSold[esi*4], eax
+
+    mov  eax, esi                       ; swap the names through tempName
+    call GetNameAddr
+    mov  ebx, edx
+    mov  eax, edi
+    call GetNameAddr
+    invoke StrCopy, ebx, ADDR tempName
+    invoke StrCopy, edx, ebx
+    invoke StrCopy, ADDR tempName, edx
+
+    xor  ecx, ecx                       ; batches follow their medicine
+swFix:
+    cmp  ecx, batCount
+    jge  swDone
+    mov  eax, batMed[ecx*4]
+    cmp  eax, esi
+    je   swToSecond
+    cmp  eax, edi
+    je   swToFirst
+    jmp  swNext
+swToSecond:
+    mov  batMed[ecx*4], edi
+    jmp  swNext
+swToFirst:
+    mov  batMed[ecx*4], esi
+swNext:
+    inc  ecx
+    jmp  swFix
+swDone:
+    ret
+SwapMedicines ENDP
+
+; key = 1 sort by name (A to Z), key = 2 sort by price (low to high)
+SortMedicines PROC USES ebx ecx edx esi edi, key:DWORD
+    mov  ecx, medCount
+    dec  ecx                            ; number of passes
+smOuter:
+    push ecx
+    xor  esi, esi
+smInner:
+    mov  edi, esi
+    inc  edi
+    cmp  edi, medCount
+    jge  smInnerDone
+    cmp  key, 1
+    je   smByName
+    mov  eax, medPrice[esi*4]
+    cmp  eax, medPrice[edi*4]
+    jle  smNoSwap
+    jmp  smDoSwap
+smByName:
+    invoke CompareMedNames, esi, edi
+    cmp  eax, 0
+    jle  smNoSwap
+smDoSwap:
+    invoke SwapMedicines, esi, edi
+smNoSwap:
+    inc  esi
+    jmp  smInner
+smInnerDone:
+    pop  ecx
+    dec  ecx
+    jnz  smOuter
+    ret
+SortMedicines ENDP
+
+StartSort PROC USES eax ebx ecx edx esi
+    cmp  medCount, 2
+    jge  stsEnough
+    invoke ShowError, ADDR msgNeedTwo
+    ret
+stsEnough:
+    invoke MessageBoxA, hMain, ADDR askSort, ADDR titleAsk, MB_YESNOCANCEL or MB_ICONQUESTION
+    mov  ebx, 1
+    cmp  eax, IDYES
+    je   stsGo
+    mov  ebx, 2
+    cmp  eax, IDNO
+    je   stsGo
+    ret
+stsGo:
+    mov  curMode, MODE_NONE
+    invoke SortMedicines, ebx
+    call AutoSave
+    invoke ShowForm, ADDR infoSort, ADDR emptyStr, ADDR emptyStr, ADDR emptyStr, 0
+    call ClearList
+    invoke PutLine, ADDR msgSortedHead, CLR_GREEN
+    xor  esi, esi
+stsLoop:
+    cmp  esi, medCount
+    jge  stsDone
+    mov  eax, esi
+    call GetNameAddr
+    mov  eax, esi
+    inc  eax
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtListMed, eax, medID[esi*4], edx, medPrice[esi*4]
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    inc  esi
+    jmp  stsLoop
+stsDone:
+    ret
+StartSort ENDP
+
+
+; ====================================================================
+; 7. SELL MEDICINE AND BILL
+; ====================================================================
+StartSell PROC USES eax ecx edx
+    cmp  medCount, 0
+    jne  ssHas
+    invoke ShowError, ADDR msgNoMeds
+    ret
+ssHas:
+    mov  curMode, MODE_SELL
+    invoke ShowForm, ADDR infoSell, ADDR lblMedId, ADDR lblQty, ADDR emptyStr, 2
+    invoke ShowWindow, hBtnFinish, SW_SHOW
+    cmp  billItemCount, 0               ; keep the lines if a bill is open
+    jne  ssEnd
+    call ClearList
+    invoke PutLine, ADDR msgSellHint1, CLR_GRAY
+    invoke PutLine, ADDR msgSellHint2, CLR_GRAY
+ssEnd:
+    ret
+StartSell ENDP
+
+; Takes qty units of a medicine from its batches, earliest expiry first.
+; Each batch used is reported in the output list.
+TakeStockFromBatches PROC USES ebx esi edi, medIdx:DWORD, qty:DWORD
+    mov  edi, qty                       ; EDI = units still to take
+tsLoop:
+    test edi, edi
+    jz   tsDone
+    invoke FindEarliestBatch, medIdx
+    cmp  eax, -1
+    je   tsDone
+    mov  esi, eax                       ; ESI = chosen batch
+    mov  ebx, batQty[esi*4]             ; EBX = what this batch has
+    cmp  ebx, edi
+    jle  tsTake                         ; batch has less or equal: take it all
+    mov  ebx, edi                       ; batch has more: take only what we need
+tsTake:
+    sub  batQty[esi*4], ebx
+    sub  edi, ebx
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtTook, ebx, batExpiry[esi*4]
+    invoke PutLine, ADDR lineBuf, CLR_GRAY
+    jmp  tsLoop
+tsDone:
+    call CleanEmptyBatches
+    ret
+TakeStockFromBatches ENDP
+
+; Adds one item (ID + quantity) to the open bill
+OkSell PROC USES ebx esi edi
+    cmp  billItemCount, MAX_BILL_ITEMS
+    jl   osRoom
+    invoke ShowInfo, ADDR msgBillFull
+    call FinishBill
+    ret
+osRoom:
+    invoke GetRangeField, hEdit1, 1, MAX_ID, ADDR msgBadId
+    test edx, edx
+    jz   osEnd
+    invoke FindMedicineById, eax
+    cmp  eax, -1
+    jne  osFound
+    invoke ShowError, ADDR msgNotFound
+    invoke SetFocus, hEdit1
+    ret
+osFound:
+    mov  ebx, eax                       ; EBX = medicine index
+    invoke GetRangeField, hEdit2, 1, MAX_QTY, ADDR msgBadQty
+    test edx, edx
+    jz   osEnd
+    mov  esi, eax                       ; ESI = quantity wanted
+    invoke GetUsableStock, ebx
+    mov  edi, eax                       ; EDI = usable stock
+    test edi, edi
+    jnz  osHasStock
+    invoke ShowError, ADDR msgOutOfStock
+    ret
+osHasStock:
+    cmp  esi, edi
+    jle  osEnough
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtNotEnough, edi
+    invoke ShowError, ADDR lineBuf
+    ret
+osEnough:
+    mov  eax, esi                       ; would the bill become too large?
+    imul eax, medPrice[ebx*4]
+    add  eax, billSubtotal
+    cmp  eax, MAX_BILL_TOTAL
+    jbe  osCapOk
+    invoke ShowError, ADDR msgBillTooBig
+    ret
+osCapOk:
+    cmp  billItemCount, 0               ; first item of a new bill: fresh list
+    jne  osTake
+    call ClearList
+osTake:
+    invoke TakeStockFromBatches, ebx, esi
+
+    mov  eax, esi                       ; amount = quantity * price
+    imul eax, medPrice[ebx*4]
+    add  billSubtotal, eax
+    mov  edi, billItemCount
+    mov  billItemMed[edi*4], ebx
+    mov  billItemQty[edi*4], esi
+    mov  billItemAmount[edi*4], eax
+    inc  billItemCount
+
+    add  medSold[ebx*4], esi            ; used for "fast sellers first"
+    add  itemsSold, esi
+    call AutoSave
+
+    mov  eax, ebx
+    call GetNameAddr
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtItem, edx, esi, billItemAmount[edi*4]
+    invoke PutLine, ADDR lineBuf, CLR_GREEN
+    call ResetInputs
+osEnd:
+    ret
+OkSell ENDP
+
+; Discount: 5% (= subtotal / 20) when the subtotal is Rs. 1000 or more
+CalculateBill PROC USES eax ebx edx
+    mov  billDiscount, 0
+    mov  eax, billSubtotal
+    cmp  eax, DISCOUNT_LIMIT
+    jb   cbNoDiscount                   ; unsigned compare
+    xor  edx, edx                       ; DIV uses EDX:EAX
+    mov  ebx, 20
+    div  ebx                            ; EAX = subtotal / 20 = 5 percent
+    mov  billDiscount, eax
+cbNoDiscount:
+    mov  eax, billSubtotal
+    sub  eax, billDiscount
+    mov  billTotal, eax
+    ret
+CalculateBill ENDP
+
+PrintReceipt PROC USES esi
+    call ClearList
+    invoke PutLine, ADDR msgReceiptTop, CLR_CYAN
+    mov  eax, billCount
+    inc  eax                            ; this bill's number
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtBillHead, eax, todayDate
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    invoke PutLine, ADDR emptyStr, CLR_WHITE
+
+    xor  esi, esi
+prLoop:
+    cmp  esi, billItemCount
+    jge  prItemsDone
+    mov  eax, billItemMed[esi*4]
+    call GetNameAddr
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtBillLine, edx, billItemQty[esi*4], billItemAmount[esi*4]
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    inc  esi
+    jmp  prLoop
+prItemsDone:
+    invoke PutLine, ADDR emptyStr, CLR_WHITE
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtSubtotal, billSubtotal
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtDiscount, billDiscount
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtTotal, billTotal
+    invoke PutLine, ADDR lineBuf, CLR_GREEN
+    invoke PutLine, ADDR msgReceiptEnd, CLR_CYAN
+    ret
+PrintReceipt ENDP
+
+; Adds the finished bill to the daily totals and empties the bill
+RecordSale PROC USES eax
+    inc  billCount
+    mov  eax, billTotal
+    add  totalSales, eax
+    cmp  eax, maxBill
+    jbe  rsKeepMax
+    mov  maxBill, eax
+rsKeepMax:
+    mov  billItemCount, 0
+    mov  billSubtotal, 0
+    ret
+RecordSale ENDP
+
+FinishBill PROC
+    cmp  billItemCount, 0
+    jne  fbHasItems
+    invoke ShowInfo, ADDR msgNoItemsSold
+    ret
+fbHasItems:
+    call CalculateBill
+    call PrintReceipt
+    call RecordSale
+    call AutoSave
+    call ResetInputs
+    ret
+FinishBill ENDP
+
+; Used when the window is closed with a bill still open
+FlushOpenBill PROC
+    cmp  billItemCount, 0
+    je   fobDone
+    call CalculateBill
+    call RecordSale
+fobDone:
+    ret
+FlushOpenBill ENDP
+
+
+; ====================================================================
+; 8. EXPIRY LOSS REPORT
+; ====================================================================
+ExpiryLossReport PROC USES eax ebx ecx edx esi edi
+    mov  curMode, MODE_NONE
+    invoke ShowForm, ADDR infoLoss, ADDR emptyStr, ADDR emptyStr, ADDR emptyStr, 0
+    call ClearList
+    mov  expiredLoss, 0
+    mov  soonLoss, 0
+    mov  lossRows, 0
+    invoke PutLine, ADDR msgLossHead, CLR_CYAN
+
+    xor  esi, esi                       ; ESI = batch index
+elLoop:
+    cmp  esi, batCount
+    jge  elDone
+    invoke GetBatchStatus, batExpiry[esi*4]
+    cmp  eax, STATUS_OK
+    je   elNext
+    mov  ebx, eax                       ; EBX = status
+
+    mov  edi, batMed[esi*4]             ; EDI = medicine index
+    mov  eax, batQty[esi*4]
+    imul eax, medPrice[edi*4]           ; EAX = quantity * price
+    mov  tmpValue, eax
+    cmp  ebx, STATUS_EXPIRED
+    jne  elIsSoon
+    add  expiredLoss, eax
+    jnc  elExpOk
+    mov  expiredLoss, 0FFFFFFFFh        ; never wrap around: stay at the maximum
+elExpOk:
+    mov  tmpColor, CLR_RED
+    mov  tmpTag, OFFSET tagExpired
+    jmp  elPrint
+elIsSoon:
+    add  soonLoss, eax
+    jnc  elSoonOk
+    mov  soonLoss, 0FFFFFFFFh
+elSoonOk:
+    mov  tmpColor, CLR_YELLOW
+    mov  tmpTag, OFFSET tagSoonShort
+elPrint:
+    mov  eax, edi
+    call GetNameAddr                    ; EDX = medicine name
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtLoss, tmpTag, edx, batQty[esi*4], batExpiry[esi*4], tmpValue
+    invoke PutLine, ADDR lineBuf, tmpColor
+    inc  lossRows
+elNext:
+    inc  esi
+    jmp  elLoop
+elDone:
+    cmp  lossRows, 0
+    jne  elTotals
+    invoke PutLine, ADDR msgNoRisk, CLR_GREEN
+    ret
+elTotals:
+    invoke PutLine, ADDR emptyStr, CLR_WHITE
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtExpiredTot, expiredLoss
+    invoke PutLine, ADDR lineBuf, CLR_RED
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtSoonTot, soonLoss
+    invoke PutLine, ADDR lineBuf, CLR_YELLOW
+    mov  eax, expiredLoss
+    add  eax, soonLoss
+    jnc  elRiskOk
+    mov  eax, 0FFFFFFFFh
+elRiskOk:
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtRiskTot, eax
+    invoke PutLine, ADDR lineBuf, CLR_CYAN
+    ret
+ExpiryLossReport ENDP
+
+
+; ====================================================================
+; 9. REORDER SUGGESTION
+; ====================================================================
+ReorderSuggestion PROC USES eax ebx ecx edx esi edi
+    mov  curMode, MODE_NONE
+    invoke ShowForm, ADDR infoReorder, ADDR emptyStr, ADDR emptyStr, ADDR emptyStr, 0
+    call ClearList
+    invoke PutLine, ADDR msgReorderHead, CLR_YELLOW
+
+    mov  lowCount, 0                    ; step 1: collect low-stock medicines
+    xor  esi, esi
+rsCollect:
+    cmp  esi, medCount
+    jge  rsCollected
+    invoke GetUsableStock, esi
+    cmp  eax, LOW_STOCK_LIMIT
+    jge  rsCollectNext
+    mov  edi, lowCount
+    mov  lowList[edi*4], esi
+    inc  lowCount
+rsCollectNext:
+    inc  esi
+    jmp  rsCollect
+
+rsCollected:
+    cmp  lowCount, 0
+    jne  rsSort
+    invoke PutLine, ADDR msgAllGood, CLR_GREEN
+    ret
+
+rsSort:                                 ; step 2: bubble sort by medSold, biggest first
+    mov  ecx, lowCount
+    dec  ecx
+    jz   rsPrint
+rsOuter:
+    push ecx
+    xor  esi, esi
+rsInner:
+    mov  edi, esi
+    inc  edi
+    cmp  edi, lowCount
+    jge  rsInnerDone
+    mov  eax, lowList[esi*4]
+    mov  ebx, lowList[edi*4]
+    mov  edx, medSold[eax*4]
+    cmp  edx, medSold[ebx*4]
+    jge  rsNoSwap
+    mov  lowList[esi*4], ebx
+    mov  lowList[edi*4], eax
+rsNoSwap:
+    inc  esi
+    jmp  rsInner
+rsInnerDone:
+    pop  ecx
+    dec  ecx
+    jnz  rsOuter
+
+rsPrint:                                ; step 3: print with suggested quantity
+    xor  edi, edi
+rsPrintLoop:
+    cmp  edi, lowCount
+    jge  rsEnd
+    mov  esi, lowList[edi*4]
+    invoke GetUsableStock, esi
+    mov  ebx, eax                       ; EBX = usable stock
+    mov  eax, medSold[esi*4]
+    xor  edx, edx
+    mov  ecx, 10
+    div  ecx                            ; EAX = sold / 10 (extra for fast sellers)
+    mov  ecx, TARGET_STOCK
+    sub  ecx, ebx
+    add  eax, ecx                       ; order = sold/10 + (30 - usable stock)
+    mov  tmpValue, eax
+    mov  eax, esi
+    call GetNameAddr
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtReorder, edx, ebx, medSold[esi*4], tmpValue
+    invoke PutLine, ADDR lineBuf, CLR_YELLOW
+    inc  edi
+    jmp  rsPrintLoop
+rsEnd:
+    ret
+ReorderSuggestion ENDP
+
+
+; ====================================================================
+; 10. DAILY SALES REPORT
+; ====================================================================
+DailySalesReport PROC USES eax ecx edx
+    mov  curMode, MODE_NONE
+    invoke ShowForm, ADDR infoSales, ADDR emptyStr, ADDR emptyStr, ADDR emptyStr, 0
+    call ClearList
+    invoke PutLine, ADDR msgSalesHead, CLR_CYAN
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtSalesDate, todayDate
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtSalesBills, billCount
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtSalesItems, itemsSold
+    invoke PutLine, ADDR lineBuf, CLR_WHITE
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtSalesTotal, totalSales
+    invoke PutLine, ADDR lineBuf, CLR_GREEN
+    invoke wsprintfA, ADDR lineBuf, ADDR fmtSalesMax, maxBill
+    invoke PutLine, ADDR lineBuf, CLR_YELLOW
+    ret
+DailySalesReport ENDP
+
+
+; ====================================================================
+; 11. SAVE / LOAD FILE
+; File = 28 bytes of counters, then the 7 arrays, always in this order.
+; ====================================================================
+
+; Writes one block. If Windows reports an error or writes fewer bytes
+; than asked, writeFailed is set to 1 so the save can be reported as failed.
+WriteChunk PROC pData:DWORD, nBytes:DWORD
+    mov  bytesDone, 0
+    invoke WriteFile, fileHandle, pData, nBytes, ADDR bytesDone, 0
+    test eax, eax
+    jz   wcFail
+    mov  eax, bytesDone
+    cmp  eax, nBytes
+    je   wcDone
+wcFail:
+    mov  writeFailed, 1
+wcDone:
+    ret
+WriteChunk ENDP
+
+; Returns EAX = number of bytes really read
+ReadChunk PROC pData:DWORD, nBytes:DWORD
+    mov  bytesDone, 0
+    invoke ReadFile, fileHandle, pData, nBytes, ADDR bytesDone, 0
+    mov  eax, bytesDone
+    ret
+ReadChunk ENDP
+
+; Writes the file without any message. Returns EAX = 1 ok, 0 failed
+SaveQuiet PROC
+    mov  writeFailed, 0
+    invoke CreateFileA, ADDR dataFileName, GENERIC_WRITE, 0, 0, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, 0
+    cmp  eax, INVALID_HANDLE_VALUE
+    jne  sqOpened
+    xor  eax, eax
+    ret
+sqOpened:
+    mov  fileHandle, eax
+    WritePart medCount,  COUNTERS_SIZE
+    WritePart medID,     MAX_MEDICINES * 4
+    WritePart medName,   MAX_MEDICINES * NAME_SIZE
+    WritePart medPrice,  MAX_MEDICINES * 4
+    WritePart medSold,   MAX_MEDICINES * 4
+    WritePart batMed,    MAX_BATCHES * 4
+    WritePart batQty,    MAX_BATCHES * 4
+    WritePart batExpiry, MAX_BATCHES * 4
+    invoke CloseHandle, fileHandle
+    cmp  writeFailed, 0
+    jne  sqFail
+    mov  eax, 1
+    ret
+sqFail:
+    xor  eax, eax
+    ret
+SaveQuiet ENDP
+
+; Called after every change so nothing is lost if the window is closed
+AutoSave PROC USES eax ecx edx
+    call SaveQuiet
+    cmp  eax, 1
+    je   asOk
+    invoke ShowError, ADDR msgSaveError
+asOk:
+    ret
+AutoSave ENDP
+
+SaveAndExit PROC USES eax ecx edx
+    call FlushOpenBill
+    call SaveQuiet
+    cmp  eax, 1
+    jne  saeFail
+    invoke ShowInfo, ADDR msgSaved
+    invoke DestroyWindow, hMain
+    ret
+saeFail:
+    invoke ShowError, ADDR msgSaveError
+    ret
+SaveAndExit ENDP
+
+; Reads the file if it exists and checks that its contents make sense.
+; loadStatus: 0 none, 1 loaded, 2 damaged
+LoadDataFromFile PROC USES ebx esi
+    mov  loadStatus, 0
+    invoke CreateFileA, ADDR dataFileName, GENERIC_READ, 0, 0, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, 0
+    cmp  eax, INVALID_HANDLE_VALUE
+    je   ldDone                         ; no file yet, start empty
+    mov  fileHandle, eax
+    ReadPart medCount,  COUNTERS_SIZE
+    ReadPart medID,     MAX_MEDICINES * 4
+    ReadPart medName,   MAX_MEDICINES * NAME_SIZE
+    ReadPart medPrice,  MAX_MEDICINES * 4
+    ReadPart medSold,   MAX_MEDICINES * 4
+    ReadPart batMed,    MAX_BATCHES * 4
+    ReadPart batQty,    MAX_BATCHES * 4
+    ReadPart batExpiry, MAX_BATCHES * 4
+    invoke CloseHandle, fileHandle
+
+    cmp  medCount, MAX_MEDICINES        ; counts must fit the arrays
+    ja   ldCorrupt
+    cmp  batCount, MAX_BATCHES
+    ja   ldCorrupt
+
+    xor  esi, esi                       ; every medicine must look sane
+ldCheckMed:
+    cmp  esi, medCount
+    jge  ldMedOk
+    cmp  medID[esi*4], 1
+    jb   ldCorrupt
+    cmp  medID[esi*4], MAX_ID
+    ja   ldCorrupt
+    cmp  medPrice[esi*4], 1
+    jb   ldCorrupt
+    cmp  medPrice[esi*4], MAX_PRICE
+    ja   ldCorrupt
+    mov  eax, esi                       ; force the last byte of the name to 0
+    imul eax, NAME_SIZE
+    mov  BYTE PTR medName[eax + NAME_SIZE - 1], 0
+    inc  esi
+    jmp  ldCheckMed
+ldMedOk:
+
+    xor  esi, esi                       ; every batch must point at a real medicine
+ldCheckBat:
+    cmp  esi, batCount
+    jge  ldBatOk
+    mov  eax, batMed[esi*4]
+    cmp  eax, medCount
+    jae  ldCorrupt
+    cmp  batQty[esi*4], MAX_QTY
+    ja   ldCorrupt
+    cmp  batExpiry[esi*4], 20000101
+    jb   ldCorrupt
+    cmp  batExpiry[esi*4], 21001231
+    ja   ldCorrupt
+    inc  esi
+    jmp  ldCheckBat
+ldBatOk:
+    mov  loadStatus, 1
+    ret
+ldReadFail:
+    invoke CloseHandle, fileHandle
+ldCorrupt:
+    mov  medCount, 0
+    mov  batCount, 0
+    mov  billCount, 0
+    mov  itemsSold, 0
+    mov  totalSales, 0
+    mov  maxBill, 0
+    mov  lastSaleDate, 0
+    mov  loadStatus, 2
+ldDone:
+    ret
+LoadDataFromFile ENDP
+
+END start
